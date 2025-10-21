@@ -351,6 +351,13 @@ class VVideoCompressionEngine {
                 return
             }
             
+            // Quality check: Warn if compression is too aggressive (>95% reduction might indicate quality loss)
+            let compressionRatio = Float(compressedSize) / Float(videoInfo.fileSizeBytes)
+            if compressionRatio < 0.05 && config.quality != .ultraLow && config.quality != .veryLow {
+                let reductionPercent = Int((1.0 - compressionRatio) * 100)
+                print("VVideoCompressionEngine: WARNING - Very aggressive compression: \(reductionPercent)% reduction. Quality may be significantly degraded.")
+            }
+            
             let result = createCompressionResult(
                 originalVideo: videoInfo,
                 compressedFile: outputURL,
@@ -460,53 +467,88 @@ class VVideoCompressionEngine {
     }
 
     private func getExportPreset(for quality: VVideoCompressQuality, advanced: VVideoAdvancedConfig? = nil, videoInfo: VVideoInfo) -> String {
-        // COMPRESSION FIX: Smart preset selection based on input video resolution
-        // Resolution-based presets only help when downscaling. If input is already at or below
-        // the preset resolution, they can INCREASE file size by re-encoding at higher bitrates.
-        // We use a hybrid approach:
-        // - For high-res videos: use resolution presets to downscale
-        // - For low-res videos: use quality presets to actually compress
+        // COMPRESSION FIX V2: Balanced preset selection
+        // The key insight: Resolution presets work well for downscaling, but we need better
+        // fallbacks than LowQuality. MediumQuality provides good compression without destroying quality.
+        // 
+        // Strategy:
+        // 1. For videos larger than target resolution: downscale with resolution preset
+        // 2. For videos at or near target resolution: use MediumQuality for balanced compression
+        // 3. Only use LowQuality for aggressive compression levels (VeryLow/UltraLow)
         
         let inputPixels = videoInfo.width * videoInfo.height
         
         // iOS Quick Fix: Improved H.265 support
         if let videoCodec = advanced?.videoCodec, videoCodec == .h265 {
             if isHEVCSupported() {
-                // For H.265, use resolution presets only if video is larger
                 switch quality {
                 case .high: 
                     return inputPixels > 2073600 ? AVAssetExportPresetHEVCHighestQuality : AVAssetExportPresetMediumQuality
                 case .medium: 
-                    return inputPixels > 2073600 ? AVAssetExportPresetHEVC1920x1080 : AVAssetExportPresetLowQuality
+                    // For 1080p, use HEVC1920x1080; for smaller, use MediumQuality
+                    return inputPixels >= 1382400 ? AVAssetExportPresetHEVC1920x1080 : AVAssetExportPresetMediumQuality
                 case .low: 
-                    return inputPixels > 921600 ? AVAssetExportPresetHEVC1920x1080 : AVAssetExportPresetLowQuality
-                case .veryLow, .ultraLow: 
+                    return inputPixels > 921600 ? AVAssetExportPresetHEVC1920x1080 : AVAssetExportPresetMediumQuality
+                case .veryLow: 
+                    return AVAssetExportPresetMediumQuality
+                case .ultraLow: 
                     return AVAssetExportPresetLowQuality
                 }
             }
         }
         
         // Smart preset selection for H.264
-        // 1920x1080 = 2,073,600 pixels
-        // 1280x720 = 921,600 pixels
-        // 960x540 = 518,400 pixels
-        // 640x480 = 307,200 pixels
+        // Resolution thresholds (pixels):
+        // 1920x1080 (1080p) = 2,073,600
+        // 1536x864 (mid-high) = 1,327,104
+        // 1280x720 (720p) = 921,600
+        // 960x540 = 518,400
+        // 640x480 = 307,200
         
         switch quality {
         case .high:
-            // Only use 1080p preset if input is significantly larger (e.g., 4K)
-            return inputPixels > 3686400 ? AVAssetExportPreset1920x1080 : AVAssetExportPresetMediumQuality
+            // 4K+ → 1080p downscale
+            // 1080p → Keep resolution but compress with MediumQuality
+            if inputPixels > 3686400 {
+                return AVAssetExportPreset1920x1080  // Downscale from 4K
+            } else if inputPixels >= 1382400 {
+                return AVAssetExportPreset1920x1080  // 1080p range: keep resolution
+            } else {
+                return AVAssetExportPresetMediumQuality  // Smaller videos: balanced compression
+            }
+            
         case .medium:
-            // Use 720p preset only if input is larger than 1080p
-            return inputPixels > 2073600 ? AVAssetExportPreset1280x720 : AVAssetExportPresetLowQuality
+            // 1080p+ → 720p downscale
+            // 720p → Balanced compression
+            // Smaller → Balanced compression
+            if inputPixels > 2073600 {
+                return AVAssetExportPreset1280x720  // Downscale from 1080p+
+            } else if inputPixels >= 691200 {
+                return AVAssetExportPreset1280x720  // 720p range: keep resolution
+            } else {
+                return AVAssetExportPresetMediumQuality  // Smaller videos: balanced compression
+            }
+            
         case .low:
-            // Use 540p preset only if input is larger than 720p
-            return inputPixels > 921600 ? AVAssetExportPreset960x540 : AVAssetExportPresetLowQuality
+            // Use 540p for videos larger than 720p, otherwise MediumQuality
+            if inputPixels > 921600 {
+                return AVAssetExportPreset960x540  // Downscale from 720p+
+            } else if inputPixels >= 460800 {
+                return AVAssetExportPreset640x480  // Mid-range: moderate downscale
+            } else {
+                return AVAssetExportPresetMediumQuality  // Small videos: balanced compression
+            }
+            
         case .veryLow:
-            // Use 480p preset only if input is significantly larger
-            return inputPixels > 518400 ? AVAssetExportPreset640x480 : AVAssetExportPresetLowQuality
+            // More aggressive but still reasonable
+            if inputPixels > 518400 {
+                return AVAssetExportPreset640x480  // Downscale larger videos
+            } else {
+                return AVAssetExportPresetMediumQuality  // Balance compression vs quality
+            }
+            
         case .ultraLow:
-            // Always use low quality preset for maximum compression
+            // Maximum compression - use LowQuality preset
             return AVAssetExportPresetLowQuality
         }
     }

@@ -159,8 +159,10 @@ class VVideoCompressionEngine {
         }
         
         print("VVideoCompressionEngine: FIXED ROTATION - Starting compression")
+        print("VVideoCompressionEngine: Input video: \(videoInfo.width)x\(videoInfo.height), \(formatFileSize(videoInfo.fileSizeBytes))")
         
-        let presetName = getExportPreset(for: config.quality, advanced: config.advanced)
+        let presetName = getExportPreset(for: config.quality, advanced: config.advanced, videoInfo: videoInfo)
+        print("VVideoCompressionEngine: Using preset: \(presetName)")
         
         guard let exportSession = AVAssetExportSession(asset: asset, presetName: presetName) else {
             callback.onError("Unable to create export session")
@@ -173,7 +175,9 @@ class VVideoCompressionEngine {
         
         // iOS Quick Fix: Optimize export settings
         exportSession.shouldOptimizeForNetworkUse = true
-        exportSession.canPerformMultiplePassesOverSourceMediaData = true
+        // COMPRESSION FIX: Multi-pass encoding increases quality but also file size
+        // Only enable for high quality settings
+        exportSession.canPerformMultiplePassesOverSourceMediaData = (config.quality == .high)
         
         // iOS Quick Fix: Add metadata
         var metadata = [AVMetadataItem]()
@@ -332,12 +336,30 @@ class VVideoCompressionEngine {
             
             callback.onProgress(1.0)
             
+            // COMPRESSION FIX: Check if output is larger than input
+            let compressedSize = getFileSize(for: outputURL)
+            if compressedSize > videoInfo.fileSizeBytes {
+                let ratio = Float(compressedSize) / Float(videoInfo.fileSizeBytes)
+                let percentIncrease = Int((ratio - 1.0) * 100)
+                print("VVideoCompressionEngine: WARNING - Output file is \(percentIncrease)% LARGER than input!")
+                print("VVideoCompressionEngine: Original: \(formatFileSize(videoInfo.fileSizeBytes)), Compressed: \(formatFileSize(compressedSize))")
+                
+                // Delete the larger output file
+                try? FileManager.default.removeItem(at: outputURL)
+                
+                callback.onError("Compression failed: Output file (\(formatFileSize(compressedSize))) would be larger than input (\(formatFileSize(videoInfo.fileSizeBytes))). The video may already be optimally compressed or use a lower quality setting.")
+                return
+            }
+            
             let result = createCompressionResult(
                 originalVideo: videoInfo,
                 compressedFile: outputURL,
                 quality: config.quality,
                 timeTaken: timeTaken
             )
+            
+            let savingsPercent = Int((1.0 - result.compressionRatio) * 100)
+            print("VVideoCompressionEngine: Compression successful! Size reduced by \(savingsPercent)% (\(formatFileSize(videoInfo.fileSizeBytes)) → \(formatFileSize(compressedSize)))")
             
             callback.onComplete(result)
             
@@ -437,24 +459,55 @@ class VVideoCompressionEngine {
         return false
     }
 
-    private func getExportPreset(for quality: VVideoCompressQuality, advanced: VVideoAdvancedConfig? = nil) -> String {
+    private func getExportPreset(for quality: VVideoCompressQuality, advanced: VVideoAdvancedConfig? = nil, videoInfo: VVideoInfo) -> String {
+        // COMPRESSION FIX: Smart preset selection based on input video resolution
+        // Resolution-based presets only help when downscaling. If input is already at or below
+        // the preset resolution, they can INCREASE file size by re-encoding at higher bitrates.
+        // We use a hybrid approach:
+        // - For high-res videos: use resolution presets to downscale
+        // - For low-res videos: use quality presets to actually compress
+        
+        let inputPixels = videoInfo.width * videoInfo.height
+        
         // iOS Quick Fix: Improved H.265 support
         if let videoCodec = advanced?.videoCodec, videoCodec == .h265 {
             if isHEVCSupported() {
+                // For H.265, use resolution presets only if video is larger
                 switch quality {
-                case .high: return AVAssetExportPresetHEVCHighestQuality
-                case .medium, .low: return AVAssetExportPresetHEVC1920x1080
-                case .veryLow, .ultraLow: return AVAssetExportPresetHEVC1920x1080
+                case .high: 
+                    return inputPixels > 2073600 ? AVAssetExportPresetHEVCHighestQuality : AVAssetExportPresetMediumQuality
+                case .medium: 
+                    return inputPixels > 2073600 ? AVAssetExportPresetHEVC1920x1080 : AVAssetExportPresetLowQuality
+                case .low: 
+                    return inputPixels > 921600 ? AVAssetExportPresetHEVC1920x1080 : AVAssetExportPresetLowQuality
+                case .veryLow, .ultraLow: 
+                    return AVAssetExportPresetLowQuality
                 }
             }
         }
         
+        // Smart preset selection for H.264
+        // 1920x1080 = 2,073,600 pixels
+        // 1280x720 = 921,600 pixels
+        // 960x540 = 518,400 pixels
+        // 640x480 = 307,200 pixels
+        
         switch quality {
-        case .high: return AVAssetExportPreset1920x1080
-        case .medium: return  AVAssetExportPreset1280x720
-        case .low: return  AVAssetExportPreset960x540
-        case .veryLow: return  AVAssetExportPreset640x480
-        case .ultraLow: return AVAssetExportPresetLowQuality
+        case .high:
+            // Only use 1080p preset if input is significantly larger (e.g., 4K)
+            return inputPixels > 3686400 ? AVAssetExportPreset1920x1080 : AVAssetExportPresetMediumQuality
+        case .medium:
+            // Use 720p preset only if input is larger than 1080p
+            return inputPixels > 2073600 ? AVAssetExportPreset1280x720 : AVAssetExportPresetLowQuality
+        case .low:
+            // Use 540p preset only if input is larger than 720p
+            return inputPixels > 921600 ? AVAssetExportPreset960x540 : AVAssetExportPresetLowQuality
+        case .veryLow:
+            // Use 480p preset only if input is significantly larger
+            return inputPixels > 518400 ? AVAssetExportPreset640x480 : AVAssetExportPresetLowQuality
+        case .ultraLow:
+            // Always use low quality preset for maximum compression
+            return AVAssetExportPresetLowQuality
         }
     }
     
